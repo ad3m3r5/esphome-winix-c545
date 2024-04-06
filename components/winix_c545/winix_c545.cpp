@@ -163,28 +163,6 @@ void WinixC545Component::publish_state_() {
           this->plasmawave_switch_->publish_state(state);
         break;
       }
-
-      case StateKey::Auto: {
-        // Auto
-        if (this->auto_switch_ == nullptr)
-          continue;
-
-        bool state = value == 1;
-        if (state != this->auto_switch_->state)
-          this->auto_switch_->publish_state(state);
-        break;
-      }
-
-      case StateKey::Speed: {
-        // Sleep is a speed value
-        if (this->sleep_switch_ == nullptr)
-          continue;
-
-        bool state = value == 6;
-        if (state != this->sleep_switch_->state)
-          this->sleep_switch_->publish_state(state);
-        break;
-      }
     }
   }
 
@@ -293,11 +271,20 @@ void WinixC545Component::parse_sentence_(char *sentence) {
 
   // Handle MCU_READY message
   if (strncmp(sentence, "MCU_READY", strlen("MCU_READY")) == 0) {
-    this->handshake_state_ = HandshakeState::McuReady;
-    this->last_handshake_event_ = millis();
-
     ESP_LOGI(TAG, "MCU_READY");
     this->write_sentence_("MCU_READY:OK");
+
+    if (this->handshake_state_ == HandshakeState::ApDeviceReady) {
+      this->handshake_state_ = HandshakeState::ApStart;
+      this->last_handshake_event_ = millis();
+
+      ESP_LOGI(TAG, "AP START");
+      this->write_sentence_("AP_STARTED:OK");
+    } else {
+      this->handshake_state_ = HandshakeState::McuReady;
+      this->last_handshake_event_ = millis();
+    }
+
     return;
   }
 
@@ -320,6 +307,9 @@ void WinixC545Component::parse_sentence_(char *sentence) {
 
   // Handle SMODE messages
   if (strncmp(sentence, "SMODE", strlen("SMODE")) == 0) {
+    this->handshake_state_ = HandshakeState::ApReboot;
+    this->last_handshake_event_ = millis();
+
     ESP_LOGI(TAG, "SMODE:OK");
     this->write_sentence_("SMODE:OK");
     return;
@@ -390,6 +380,41 @@ void WinixC545Component::update_handshake_state_() {
       this->write_sentence_("AWS_IND:CONNECT OK");
       break;
     }
+
+    case HandshakeState::ApReboot: {
+      // AP mode requested, pretend to reboot into AP
+      this->handshake_state_ = HandshakeState::ApDeviceReady;
+      this->last_handshake_event_ = millis();
+
+      ESP_LOGI(TAG, "AP DEVICEREADY");
+      this->write_sentence_("DEVICEREADY");
+      break;
+    }
+
+    case HandshakeState::ApStart: {
+      // Exit AP mode
+      this->handshake_state_ = HandshakeState::ApStop;
+      this->last_handshake_event_ = millis();
+
+      ESP_LOGI(TAG, "AP STOP");
+      this->write_sentence_("AP_STOPED:OK");
+      this->write_sentence_("ASSOCIATED:0");
+      // TODO could get real network info but I don't think it matters
+      this->write_sentence_("IPALLOCATED:10.100.1.250 255.255.255.0 10.100.1.1 10.100.1.6");
+      this->write_sentence_("AWS_IND:CONNECT OK");
+      break;
+    }
+
+    default: {
+      // If in an intermediate state and no activity occurs for a while reset the state machine
+      if ((millis() - this->last_handshake_event_) < 10000)
+        return;
+
+      // Reset handshake state
+      ESP_LOGW(TAG, "Handshake stalled in state %d. Restarting.", this->handshake_state_);
+      this->handshake_state_ = HandshakeState::Reset;
+      break;
+    }
   }
 }
 
@@ -438,8 +463,6 @@ void WinixC545Component::dump_config() {
 
 #ifdef USE_SWITCH
   LOG_SWITCH("  ", "Plasmawave Switch", this->plasmawave_switch_);
-  LOG_SWITCH("  ", "Auto Switch", this->auto_switch_);
-  LOG_SWITCH("  ", "Sleep Switch", this->sleep_switch_);
 #endif
 }
 
@@ -503,6 +526,29 @@ void WinixC545Fan::update_state(const WinixStateMap &states) {
 
         // Speed has changed, publish
         this->speed = speed;
+
+        // Set preset mode to Sleep if speed indicates sleep and Auto is not enabled
+        if (this->preset_mode != PRESET_AUTO)
+          this->preset_mode = (value == 6) ? PRESET_SLEEP : PRESET_NONE;
+
+        publish = true;
+
+        break;
+      }
+
+      case StateKey::Auto: {
+        // Auto
+        std::string preset_mode = this->preset_mode;
+        if (value == 1)
+          preset_mode = PRESET_AUTO;
+        else if (this->preset_mode == PRESET_AUTO)
+          preset_mode = PRESET_NONE;
+
+        if (preset_mode == this->preset_mode)
+          continue;
+
+        // Preset has changed, publish
+        this->preset_mode = preset_mode;
         publish = true;
 
         break;
@@ -527,6 +573,18 @@ void WinixC545Fan::control(const fan::FanCall &call) {
     // Speed has changed
     this->speed = *call.get_speed();
     states.emplace(StateKey::Speed, this->speed == 4 ? 5 : this->speed);
+  }
+
+  if (this->preset_mode != call.get_preset_mode()) {
+    this->preset_mode = call.get_preset_mode();
+
+    // Update auto mode
+    if (this->preset_mode == PRESET_AUTO)
+      states.emplace(StateKey::Auto, 1);
+
+    // Set sleep mode
+    if (this->preset_mode == PRESET_SLEEP)
+      states.emplace(StateKey::Speed, 6);
   }
 
   this->parent_->write_state(states);
